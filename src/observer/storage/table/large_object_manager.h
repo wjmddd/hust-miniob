@@ -5,6 +5,7 @@
 #pragma once
 #define OBJ_MAX_LENGTH 4096
 
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string>
