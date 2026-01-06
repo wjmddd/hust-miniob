@@ -398,6 +398,267 @@ RC Stmt::create_stmt(Db *db, ParsedSqlNode &sql_node, Stmt *&stmt)
 
 ---
 
+## 第3.5章：FilterStmt 详解（WHERE 条件处理）
+
+### 📝 3.5.1 什么是 FilterStmt？
+
+`FilterStmt` 是 **WHERE 子句的语义表示**，用于在执行阶段过滤需要处理的记录。
+
+```
+SQL: UPDATE students SET age = 25 WHERE id = 1 AND name = 'Tom';
+                                  └──────────────────────────┘
+                                         这部分由 FilterStmt 表示
+```
+
+### 📝 3.5.2 FilterStmt 的结构
+
+```cpp
+// src/observer/sql/stmt/filter_stmt.h
+
+class FilterStmt
+{
+public:
+    // 获取过滤条件列表
+    const std::vector<std::unique_ptr<Expression>> &conditions() const {
+        return conditions_;
+    }
+    
+    // 获取条件连接符（AND/OR）
+    const std::vector<ConjunctionType> &conjunction_types() const {
+        return conjunction_types_;
+    }
+
+private:
+    std::vector<std::unique_ptr<Expression>> conditions_;     // 条件表达式列表
+    std::vector<ConjunctionType> conjunction_types_;          // 连接符（AND/OR）
+};
+```
+
+### 📝 3.5.3 举例说明
+
+对于 SQL：
+```sql
+UPDATE students SET age = 25 WHERE id = 1 AND score > 80;
+```
+
+FilterStmt 的内部结构：
+
+```
+FilterStmt
+├── conditions_                          // 条件表达式列表
+│   ├── [0] ComparisonExpr               // 第一个条件：id = 1
+│   │       ├── left:  FieldExpr(id)     //   左边：字段 id
+│   │       ├── op:    EQUAL_TO          //   操作符：=
+│   │       └── right: ValueExpr(1)      //   右边：值 1
+│   │
+│   └── [1] ComparisonExpr               // 第二个条件：score > 80
+│           ├── left:  FieldExpr(score)  //   左边：字段 score
+│           ├── op:    GREAT_THAN        //   操作符：>
+│           └── right: ValueExpr(80)     //   右边：值 80
+│
+└── conjunction_types_                   // 连接符列表
+    └── [0] AND                          // 第一个连接符：AND
+```
+
+### 📝 3.5.4 FilterStmt::create 实现
+
+```cpp
+// src/observer/sql/stmt/filter_stmt.cpp
+
+RC FilterStmt::create(Db *db, Table *default_table,
+    std::unordered_map<std::string, Table *> *tables,
+    std::vector<ConditionSqlNode> &conditions,
+    FilterStmt *&stmt)
+{
+    RC rc = RC::SUCCESS;
+    stmt = nullptr;
+
+    // ========== 步骤1：将条件转换为表达式 ==========
+    // 把 Parser 阶段的 ConditionSqlNode 转换为 ComparisonExpr
+    vector<unique_ptr<Expression>> conditions_exprs;
+    
+    for (auto &condition : conditions) {
+        switch (condition.comp_op) {
+            case CompOp::EQUAL_TO:      // =
+            case CompOp::NOT_EQUAL:     // <> 或 !=
+            case CompOp::LESS_THAN:     // <
+            case CompOp::LESS_EQUAL:    // <=
+            case CompOp::GREAT_THAN:    // >
+            case CompOp::GREAT_EQUAL:   // >=
+            case CompOp::COMP_IS:       // IS (用于 NULL 比较)
+            case CompOp::COMP_IS_NOT:   // IS NOT
+            {
+                // 创建比较表达式
+                conditions_exprs.emplace_back(
+                    std::make_unique<ComparisonExpr>(
+                        condition.comp_op,
+                        std::move(condition.left_expr),
+                        std::move(condition.right_expr)
+                    )
+                );
+            } break;
+            
+            default:
+                LOG_WARN("unsupported operator: %d", condition.comp_op);
+                return RC::INVALID_ARGUMENT;
+        }
+    }
+
+    // ========== 步骤2：创建绑定上下文 ==========
+    // 将所有相关的表添加到上下文中，用于字段查找
+    BinderContext binder_context;
+    for (auto &table : *tables) {
+        binder_context.add_table(table.second);
+    }
+    ExpressionBinder expression_binder(binder_context);
+
+    // ========== 步骤3：绑定表达式（字段校验）==========
+    // 在这里检查 WHERE 条件中的字段是否存在
+    vector<unique_ptr<Expression>> bound_conditions;
+    auto *tmp_stmt = new FilterStmt();
+    
+    for (size_t i = 0; i < conditions.size(); i++) {
+        // 保存连接符（AND/OR）
+        tmp_stmt->conjunction_types_.push_back(conditions[i].conjunction_type);
+        
+        // 绑定表达式（同时校验字段是否存在）
+        RC rc = expression_binder.bind_expression(
+            conditions_exprs[i], bound_conditions
+        );
+        
+        if (rc != RC::SUCCESS) {
+            // 字段不存在等错误
+            delete tmp_stmt;
+            LOG_WARN("failed to bind expression. index=%d", i);
+            return rc;
+        }
+    }
+
+    // ========== 步骤4：构建 FilterStmt ==========
+    tmp_stmt->conditions_.swap(bound_conditions);
+    stmt = tmp_stmt;
+    
+    return RC::SUCCESS;
+}
+```
+
+### 📝 3.5.5 在 UPDATE 中的数据流
+
+```
+                    UPDATE students SET age=25 WHERE id=1 AND score>80
+                                    │
+                                    ▼
+                    ┌───────────────────────────────────┐
+                    │         UpdateSqlNode             │
+                    │  ├── relation_name: "students"    │
+                    │  ├── attribute_name: "age"        │
+                    │  ├── value: 25                    │
+                    │  └── conditions: [id=1, score>80] │◄── Parser 输出
+                    └───────────────────────────────────┘
+                                    │
+                                    ▼  UpdateStmt::create()
+                    ┌───────────────────────────────────┐
+                    │          UpdateStmt               │
+                    │  ├── table_: students表对象        │
+                    │  ├── field_meta_: age字段元数据    │
+                    │  ├── value_: 25                   │
+                    │  └── filter_stmt_: ──────────────────┐
+                    └───────────────────────────────────┘  │
+                                                           │
+                                                           ▼
+                    ┌─────────────────────────────────────────────────┐
+                    │                  FilterStmt                     │
+                    │  ├── conditions_:                               │
+                    │  │   ├── ComparisonExpr(id = 1)                 │
+                    │  │   │   ├── left: FieldExpr(students.id)       │
+                    │  │   │   ├── op: EQUAL_TO                       │
+                    │  │   │   └── right: ValueExpr(1)                │
+                    │  │   │                                          │
+                    │  │   └── ComparisonExpr(score > 80)             │
+                    │  │       ├── left: FieldExpr(students.score)    │
+                    │  │       ├── op: GREAT_THAN                     │
+                    │  │       └── right: ValueExpr(80)               │
+                    │  │                                              │
+                    │  └── conjunction_types_: [AND]                  │
+                    └─────────────────────────────────────────────────┘
+```
+
+### 📝 3.5.6 在执行阶段的作用
+
+FilterStmt 最终被转换为 **PredicateOperator**，在执行计划中过滤记录：
+
+```
+执行计划结构：
+
+UpdatePhysicalOperator          ← 执行 UPDATE 操作
+    │
+    └── PredicatePhysicalOperator   ← 【使用 FilterStmt 过滤记录】
+            │                          只放行满足 WHERE 条件的记录
+            │
+            └── TableScanPhysicalOperator  ← 扫描全表
+```
+
+执行流程：
+
+```cpp
+// UpdatePhysicalOperator::open() 中
+
+while (OB_SUCC(rc = child->next())) {
+    // child 是 PredicateOperator
+    // 它内部使用 FilterStmt 的条件进行过滤
+    // 只有满足 id=1 AND score>80 的记录才会被返回
+    
+    Tuple *tuple = child->current_tuple();
+    Record &record = row_tuple->record();
+    
+    // 只收集满足条件的记录
+    records_.emplace_back(std::move(record));
+}
+
+// 然后只更新这些满足条件的记录
+for (Record &record : records_) {
+    rc = trx_->update_record(table_, record, field_meta_->name(), value_);
+}
+```
+
+### 📝 3.5.7 没有 WHERE 的情况
+
+如果 UPDATE 没有 WHERE 子句：
+
+```sql
+UPDATE students SET age = 30;  -- 更新所有记录
+```
+
+此时：
+- `UpdateSqlNode.conditions` 为空
+- `FilterStmt::create()` 会创建一个空的 FilterStmt
+- `PredicateOperator` 会放行所有记录（相当于没有过滤）
+- 结果：更新表中所有记录
+
+```cpp
+// UpdateStmt::create 中
+if (!update.conditions.empty()) {
+    // 有 WHERE 条件，创建 FilterStmt
+    rc = FilterStmt::create(...);
+} else {
+    // 没有 WHERE 条件，filter_stmt_ 为 nullptr
+    filter_stmt_ = nullptr;
+}
+```
+
+### 📝 3.5.8 FilterStmt 的关键作用总结
+
+| 组件 | 职责 |
+|------|------|
+| **UpdateStmt** | 知道要更新哪个表、哪个字段、更新成什么值 |
+| **FilterStmt** | 知道要更新哪些记录（WHERE条件的语义表示） |
+| **PredicateOperator** | 在执行时根据 FilterStmt 过滤记录 |
+| **UpdatePhysicalOperator** | 对过滤后的记录执行实际的更新操作 |
+
+简单来说：**FilterStmt 是 WHERE 子句从语法解析结果到执行计划之间的桥梁**。
+
+---
+
 ## 第4阶段：Optimizer 生成执行计划
 
 ### 📝 4.1 UpdateLogicalOperator
